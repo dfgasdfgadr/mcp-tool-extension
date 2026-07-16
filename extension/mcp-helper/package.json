@@ -1,0 +1,11 @@
+{
+  "name": "ai-req-mcp-helper",
+  "version": "1.0.0",
+  "description": "MCP Helper for AI Request Analyzer extension",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs --port 9527",
+    "install-host": "node install.mjs"
+  }
+}

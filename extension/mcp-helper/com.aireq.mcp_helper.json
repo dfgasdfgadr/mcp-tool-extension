@@ -1,0 +1,10 @@
+{
+  "name": "com.aireq.mcp_helper",
+  "description": "AI Request Analyzer MCP Helper",
+  "path": "c:\\Users\\DH\\Desktop\\无限试用脚本\\aiMCPTool\\extension\\mcp-helper\\com.aireq.mcp_helper.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://njgfblgbmbhkegiaopcpnikggdmieodc/",
+    "chrome-extension://nemmokmbhlmcipjodfcdgckmmpjcofgp/"
+  ]
+}

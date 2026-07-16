@@ -1,0 +1,10 @@
+{
+  "name": "com.aireq.mcp_helper",
+  "description": "AI Request Analyzer MCP Helper",
+  "path": "{{PLACEHOLDER_SERVER_PATH}}",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://njgfblgbmbhkegiaopcpnikggdmieodc/",
+    "chrome-extension://nemmokmbhlmcipjodfcdgckmmpjcofgp/"
+  ]
+}
