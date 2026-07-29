@@ -1,6 +1,6 @@
 var FIELD_SOURCES_KEY_PREFIX = 'ai_req_field_sources_';
-var MAX_PROVENANCE_NODES = 8000;
-var MAX_PROVENANCE_TEXT_CHARS = 512 * 1024;
+var MAX_PROVENANCE_NODES = 40000;
+var MAX_PROVENANCE_TEXT_CHARS = 2 * 1024 * 1024;
 var MAX_PROVENANCE_SELECTED_TEXT = 120;
 var MAX_PROVENANCE_CANDIDATES = 10;
 
@@ -178,10 +178,23 @@ function walkJsonPrimitives(value, segments, visitor, limits) {
   }
 }
 
+function isTruncatedArchiveResponseBody(body) {
+  return !!(body && typeof body === 'object' && !Array.isArray(body) && body.__archiveTruncated);
+}
+
 function getRecordResponseJson(record) {
   if (!record) return null;
   var body = record.responseBody;
   if (body === null || typeof body === 'undefined') return null;
+  if (isTruncatedArchiveResponseBody(body)) {
+    if (typeof body.preview === 'string' && body.preview) {
+      try {
+        var fromPreview = JSON.parse(body.preview);
+        if (fromPreview && typeof fromPreview === 'object') return fromPreview;
+      } catch (ePreview) {}
+    }
+    return null;
+  }
   if (typeof body === 'object') return body;
   if (typeof body === 'string') {
     if (body.length > MAX_PROVENANCE_TEXT_CHARS) return null;
@@ -200,9 +213,10 @@ function shouldSkipProvenanceRecord(record) {
   if (/\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|mp4|mp3|wav|avi|map|webp)(\?|#|$)/i.test(url)) return true;
   if (url.indexOf('api.moonshot.cn') !== -1) return true;
   var lower = String(url).toLowerCase();
-  if (/track|analytics|sentry|beacon|collect|log|monitor/.test(lower)) return true;
-  if (!getRecordResponseJson(record)) return true;
-  return false;
+  if (/(?:^|[\/_.?=&-])(?:track|analytics|sentry|beacon|collect|logs?|monitor)(?:[\/_.?=&-]|$)/.test(lower)) return true;
+  if (getRecordResponseJson(record)) return false;
+  if (isTruncatedArchiveResponseBody(record.responseBody) && record.responseBody.preview) return false;
+  return true;
 }
 
 function findFlowMetaForRequestId(requestId) {
@@ -221,17 +235,13 @@ function findFlowMetaForRequestId(requestId) {
   return null;
 }
 
-function buildProvenanceSearchRecords() {
-  var seen = {};
-  var ordered = [];
-  function pushRecord(rec, scope) {
-    if (!rec || !rec.id || seen[rec.id] || shouldSkipProvenanceRecord(rec)) return;
-    seen[rec.id] = true;
-    ordered.push({ record: rec, scope: scope });
-  }
+function getFlowRecordsStorageKey(hostname, flowId) {
+  return 'ai_req_flow_records_' + String(hostname || '').replace(/[^\w.-]/g, '_') + '_' + String(flowId || '');
+}
 
+function resolveProvenanceTargetFlow() {
   ensureFlowState();
-  var flow = getSelectedFlow ? getSelectedFlow() : null;
+  var flow = typeof getSelectedFlow === 'function' ? getSelectedFlow() : null;
   if (!flow && state.flowUi && state.flowUi.selectedFlowId) {
     flow = state.flows[state.flowUi.selectedFlowId] || null;
   }
@@ -242,6 +252,57 @@ function buildProvenanceSearchRecords() {
     });
     if (fids.length) flow = state.flows[fids[0]];
   }
+  return flow || null;
+}
+
+function ensureFlowRecordsLoadedForProvenance(done) {
+  var flow = resolveProvenanceTargetFlow();
+  if (!flow || !flow.id) {
+    if (typeof done === 'function') done(0);
+    return;
+  }
+  var hosts = [];
+  var primaryHost = flow.hostname || (typeof location !== 'undefined' ? location.hostname : '');
+  if (primaryHost) hosts.push(primaryHost);
+  if (typeof location !== 'undefined' && location.hostname && hosts.indexOf(location.hostname) === -1) {
+    hosts.push(location.hostname);
+  }
+  var keys = [];
+  for (var hi = 0; hi < hosts.length; hi++) {
+    keys.push(getFlowRecordsStorageKey(hosts[hi], flow.id));
+  }
+  var pending = keys.length;
+  var totalAdded = 0;
+  if (!pending) {
+    if (typeof done === 'function') done(0);
+    return;
+  }
+  function finishOne(added) {
+    totalAdded += added || 0;
+    pending--;
+    if (pending <= 0 && typeof done === 'function') done(totalAdded);
+  }
+  for (var ki = 0; ki < keys.length; ki++) {
+    var key = keys[ki];
+    if (typeof loadArchivedFlowRecords === 'function') loadArchivedFlowRecords(key);
+    if (typeof loadArchivedFlowRecordsFresh === 'function') {
+      loadArchivedFlowRecordsFresh(key, finishOne);
+    } else {
+      finishOne(0);
+    }
+  }
+}
+
+function buildProvenanceSearchRecords() {
+  var seen = {};
+  var ordered = [];
+  function pushRecord(rec, scope) {
+    if (!rec || !rec.id || seen[rec.id] || shouldSkipProvenanceRecord(rec)) return;
+    seen[rec.id] = true;
+    ordered.push({ record: rec, scope: scope });
+  }
+
+  var flow = resolveProvenanceTargetFlow();
   if (flow && flow.steps) {
     for (var si = 0; si < flow.steps.length; si++) {
       var ids = flow.steps[si].requestIds || [];
@@ -305,7 +366,7 @@ function buildMatchReasons(ctx) {
   return reasons;
 }
 
-var MAX_PROVENANCE_INDEX_BYTES = 512 * 1024;
+var MAX_PROVENANCE_INDEX_BYTES = 2 * 1024 * 1024;
 var PROVENANCE_INDEX_MAX_DEPTH = 200;
 var PROV_KEY_SKIP_RE = /[.\[\]"\\]/;
 
@@ -316,6 +377,8 @@ function getRecordProvBodyString(record) {
   var str = null;
   if (typeof body === 'string') {
     str = body;
+  } else if (isTruncatedArchiveResponseBody(body) && typeof body.preview === 'string') {
+    str = body.preview;
   } else if (body && typeof body === 'object') {
     try { str = JSON.stringify(body); } catch (e) { str = null; }
   }
@@ -461,16 +524,10 @@ function ensureRecordOffsetIndex(record) {
   return index;
 }
 
-function binarySearchIndexByStart(entries, pos) {
-  var lo = 0, hi = entries.length - 1, best = -1;
-  while (lo <= hi) {
-    var mid = (lo + hi) >> 1;
-    if (entries[mid].start <= pos) { best = mid; lo = mid + 1; }
-    else hi = mid - 1;
-  }
-  if (best < 0) return null;
-  var e = entries[best];
-  return e.end > pos ? e : null;
+function invalidateProvenanceCache(record) {
+  if (!record) return;
+  delete record._provBodyStr;
+  delete record._provIndex;
 }
 
 function buildProvenanceCandidate(rec, item, jsonPath, value, matchType, flowMeta, verified, core, idx, totalRecords) {
@@ -532,6 +589,61 @@ function collectCandidatesByWalk(rec, item, text, idx, totalRecords, rawCandidat
   return limits.partial;
 }
 
+function collectCandidatesByIndex(rec, item, index, text, idx, totalRecords, rawCandidates, seenKey) {
+  if (!index || !index.entries) return false;
+  var flowMeta = findFlowMetaForRequestId(rec.id);
+  var flowId = flowMeta ? flowMeta.flowId : null;
+  var verified = false;
+  var core = false;
+  if (flowId && state.flows[flowId]) {
+    verified = (state.flows[flowId].verifiedRequestIds || []).indexOf(rec.id) !== -1;
+    core = ((state.flows[flowId].classifications || {})[rec.id] || '') === 'core';
+  }
+  var entries = index.entries;
+  for (var ei = 0; ei < entries.length; ei++) {
+    var e = entries[ei];
+    var matchType = matchPrimitiveValue(text, e.value);
+    if (!matchType) continue;
+    var jsonPath = formatJsonPathFromSegments(e.segments);
+    if (!isSupportedJsonPath(jsonPath)) continue;
+    var dk = rec.id + '\n' + jsonPath;
+    if (seenKey[dk]) continue;
+    seenKey[dk] = true;
+    rawCandidates.push(buildProvenanceCandidate(rec, item, jsonPath, e.value, matchType, flowMeta, verified, core, idx, totalRecords));
+  }
+  return false;
+}
+
+function collectCandidatesByRawContains(rec, item, text, idx, totalRecords, rawCandidates, seenKey) {
+  var str = getRecordProvBodyString(rec);
+  if (!str && isTruncatedArchiveResponseBody(rec.responseBody) && typeof rec.responseBody.preview === 'string') {
+    str = rec.responseBody.preview;
+  }
+  if (!str) return false;
+  var lowerSel = normalizeProvenanceText(text);
+  if (!lowerSel || str.toLowerCase().indexOf(lowerSel) === -1) return false;
+  var jsonPath = '$';
+  var dk = rec.id + '\n' + jsonPath + '\nraw';
+  if (seenKey[dk]) return true;
+  seenKey[dk] = true;
+  var flowMeta = findFlowMetaForRequestId(rec.id);
+  var flowId = flowMeta ? flowMeta.flowId : null;
+  var verified = false;
+  var core = false;
+  if (flowId && state.flows[flowId]) {
+    verified = (state.flows[flowId].verifiedRequestIds || []).indexOf(rec.id) !== -1;
+    core = ((state.flows[flowId].classifications || {})[rec.id] || '') === 'core';
+  }
+  var quoted = '"' + String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  var matchType = str.indexOf(quoted) !== -1 ? 'exact' : 'contains';
+  var candidate = buildProvenanceCandidate(rec, item, jsonPath, text, matchType, flowMeta, verified, core, idx, totalRecords);
+  candidate.truncated = true;
+  candidate.partialSearch = true;
+  candidate.matchReasons = (candidate.matchReasons || []).concat(['响应体过大或已截断，仅定位到请求']);
+  rawCandidates.push(candidate);
+  return true;
+}
+
 function findFieldSourceCandidates(selectedText, options) {
   options = options || {};
   var text = String(selectedText || '').trim();
@@ -559,70 +671,21 @@ function findFieldSourceCandidates(selectedText, options) {
     var item = searchItems[idx];
     var rec = item.record;
     var index = ensureRecordOffsetIndex(rec);
+    var beforeCount = rawCandidates.length;
 
     if (!index) {
       if (collectCandidatesByWalk(rec, item, text, idx, totalRecords, rawCandidates, seenKey)) {
         partialSearch = true;
       }
-      continue;
-    }
-
-    var lowerBody = index.lowerBody;
-    var entries = index.entries;
-    var flowMeta = findFlowMetaForRequestId(rec.id);
-    var flowId = flowMeta ? flowMeta.flowId : null;
-    var verified = false;
-    var core = false;
-    if (flowId && state.flows[flowId]) {
-      verified = (state.flows[flowId].verifiedRequestIds || []).indexOf(rec.id) !== -1;
-      core = ((state.flows[flowId].classifications || {})[rec.id] || '') === 'core';
-    }
-
-    var pos = lowerBody.indexOf(lowerSel, 0);
-    if (pos === -1) {
-      for (var ei = 0; ei < entries.length; ei++) {
-        var e = entries[ei];
-        if (!e.rawHasEscape) continue;
-        var mt = matchPrimitiveValue(text, e.value);
-        if (!mt) continue;
-        var jp = formatJsonPathFromSegments(e.segments);
-        if (!isSupportedJsonPath(jp)) continue;
-        var dk = rec.id + '\n' + jp;
-        if (seenKey[dk]) continue;
-        seenKey[dk] = true;
-        rawCandidates.push(buildProvenanceCandidate(rec, item, jp, e.value, mt, flowMeta, verified, core, idx, totalRecords));
-      }
-      continue;
-    }
-
-    while (pos !== -1) {
-      var hit = binarySearchIndexByStart(entries, pos);
-      if (hit) {
-        var jp2 = formatJsonPathFromSegments(hit.segments);
-        if (isSupportedJsonPath(jp2)) {
-          var dk2 = rec.id + '\n' + jp2;
-          if (!seenKey[dk2]) {
-            seenKey[dk2] = true;
-            var mt2 = matchPrimitiveValue(text, hit.value) || 'normalized';
-            rawCandidates.push(buildProvenanceCandidate(rec, item, jp2, hit.value, mt2, flowMeta, verified, core, idx, totalRecords));
-          }
+      if (rawCandidates.length === beforeCount) {
+        if (collectCandidatesByRawContains(rec, item, text, idx, totalRecords, rawCandidates, seenKey)) {
+          partialSearch = true;
         }
       }
-      pos = lowerBody.indexOf(lowerSel, pos + lowerSel.length);
+      continue;
     }
 
-    for (var ei2 = 0; ei2 < entries.length; ei2++) {
-      var e2 = entries[ei2];
-      if (!e2.rawHasEscape) continue;
-      var mt3 = matchPrimitiveValue(text, e2.value);
-      if (!mt3) continue;
-      var jp3 = formatJsonPathFromSegments(e2.segments);
-      if (!isSupportedJsonPath(jp3)) continue;
-      var dk3 = rec.id + '\n' + jp3;
-      if (seenKey[dk3]) continue;
-      seenKey[dk3] = true;
-      rawCandidates.push(buildProvenanceCandidate(rec, item, jp3, e2.value, mt3, flowMeta, verified, core, idx, totalRecords));
-    }
+    collectCandidatesByIndex(rec, item, index, text, idx, totalRecords, rawCandidates, seenKey);
   }
 
   rawCandidates.sort(function (a, b) { return b.score - a.score; });

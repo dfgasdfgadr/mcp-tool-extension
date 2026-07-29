@@ -7,7 +7,7 @@ public static class Program {
     try {
       var psi = new ProcessStartInfo();
       psi.FileName = @"C:\Users\DH\AppData\Local\nodejs\node.exe";
-      psi.WorkingDirectory = @"c:\Users\DH\Desktop\无限试用脚本\aiMCPTool\extension\mcp-helper";
+      psi.WorkingDirectory = @"C:\Users\DH\Desktop\无限试用脚本\aiMCPTool\.worktrees\cross-account-runtime-auth\code\extension\mcp-helper";
       psi.UseShellExecute = false;
       psi.Arguments = JoinArgs(BuildArgs(args));
       using (var process = Process.Start(psi)) {
@@ -22,7 +22,7 @@ public static class Program {
 
   private static string[] BuildArgs(string[] args) {
     var list = new List<string>();
-    list.Add(@"c:\Users\DH\Desktop\无限试用脚本\aiMCPTool\extension\mcp-helper\server.mjs");
+    list.Add(@"C:\Users\DH\Desktop\无限试用脚本\aiMCPTool\.worktrees\cross-account-runtime-auth\code\extension\mcp-helper\server.mjs");
     for (int i = 0; i < args.Length; i++) {
       list.Add(args[i]);
     }

@@ -17,8 +17,8 @@ var FLOW_RECORDING_SESSION_KEY = 'ai_req_active_recording_session';
 var FLOW_RECORDING_SCHEMA_VERSION = 1;
 var FLOW_RECORDS_KEY_PREFIX = 'ai_req_flow_records_';
 var FLOW_RECORD_ARCHIVE_MAX_CHARS = 4 * 1024 * 1024;
-var FLOW_RECORD_BODY_FIELD_MAX_CHARS = 64 * 1024;
-var FLOW_RECORD_COMPACT_BODY_MAX_CHARS = 8 * 1024;
+var FLOW_RECORD_BODY_FIELD_MAX_CHARS = 512 * 1024;
+var FLOW_RECORD_COMPACT_BODY_MAX_CHARS = 64 * 1024;
 var FLOW_RECORD_HEADER_VALUE_MAX_CHARS = 4096;
 var FLOW_RECORD_COMPACT_HEADER_VALUE_MAX_CHARS = 1024;
 var recordingSessionCache = null;
@@ -2550,10 +2550,10 @@ function buildMcpAuthError(errorCode, details) {
     AUTH_SESSION_MISSING: '未获取到当前页面的实时登录凭据。',
     AUTH_REJECTED: '服务端拒绝了当前浏览器会话。',
     AUTH_CONTEXT_STALE: '检测到账号会话已变化，请重新发起操作。',
-    AUTH_ACCOUNT_AMBIGUOUS: '存在多个可能的账号上下文，请仅保留目标账号页面。',
+    AUTH_ACCOUNT_AMBIGUOUS: '存在多个账号上下文，请从候选列表中选择目标页面后以 __authTabId 重试。',
     AUTH_SOURCE_UNSAFE: '只能取得录制时的旧凭据，已拒绝执行。'
   };
-  return {
+  var result = {
     ok: false,
     status: Number(source.status || 0),
     errorCode: code,
@@ -2571,6 +2571,12 @@ function buildMcpAuthError(errorCode, details) {
       ? !!source.retryable
       : true
   };
+  if (Array.isArray(source.candidates) && source.candidates.length) {
+    result.candidates = source.candidates;
+    result.selectionHint =
+      '多个账号上下文：请选择一个候选页面，将其 tabId 作为 __authTabId 参数加入工具入参后重试。';
+  }
+  return result;
 }
 
 function summarizeMcpArguments(toolArguments) {
@@ -2765,6 +2771,56 @@ function prepareToolMetaForRuntime(toolDef, toolMeta, items, matchedStorageHost)
   return enrichToolMetaHosts(meta, matchedStorageHost);
 }
 
+// Revalidate a recently-expired live auth record by replaying it against the
+// very GET endpoint the caller wanted. 2xx proves the credential is still
+// accepted and re-arms the observation; 401/403 proves it is dead.
+// Returns 'refreshed' | 'rejected' | 'failed'.
+async function attemptAuthProbeRevalidation(probeHint, meta, toolArguments) {
+  var origin = probeHint && probeHint.origin;
+  var tabId = probeHint && probeHint.tabId;
+  if (!origin || typeof tabId !== 'number') return 'failed';
+  var stale = AiRuntimeAuthSession.getStaleAuthForProbe(origin, tabId, Date.now());
+  if (!stale.ok) return 'failed';
+  var parted = partitionMcpToolArguments(meta, toolArguments || {});
+  var queryString = '';
+  var argKeys = Object.keys(parted.restArgs);
+  for (var i = 0; i < argKeys.length; i++) {
+    queryString += (queryString ? '&' : '?') +
+      encodeURIComponent(argKeys[i]) + '=' +
+      encodeURIComponent(String(parted.restArgs[argKeys[i]]));
+  }
+  var probeUrl = buildSameOriginMcpUrl(origin, parted.pathname, queryString);
+  if (!probeUrl) return 'failed';
+  var status = 0;
+  try {
+    var resp = await fetch(probeUrl, {
+      method: 'GET',
+      headers: stale.staleAuth.explicitHeaders,
+      credentials: 'omit',
+      cache: 'no-store'
+    });
+    status = resp.status;
+  } catch (_probeError) {
+    return 'failed';
+  }
+  if (status === 401 || status === 403) return 'rejected';
+  if (status < 200 || status >= 300) return 'failed';
+  await AiRuntimeAuthSession.observeLiveAuth({
+    apiOrigin: origin,
+    tabId: tabId,
+    requestHeaders: stale.staleAuth.explicitHeaders,
+    observedAt: Date.now()
+  });
+  await AiRuntimeAuthSession.observeSamePathApi({
+    tabId: tabId,
+    apiOrigin: origin,
+    pathPatternKey: meta.pathPatternKey ||
+      AiSiteAffinity.buildPathPatternKey(meta.method, meta.pathname || meta.pathnameTemplate),
+    observedAt: Date.now()
+  });
+  return 'refreshed';
+}
+
 async function prepareMcpRuntimeExecution(
   callId,
   toolName,
@@ -2782,14 +2838,49 @@ async function prepareMcpRuntimeExecution(
       safeRuntimeAuthErrorCode(error, 'AUTH_TAB_QUERY_FAILED')
     );
   }
-  var affinity = await AiRuntimeAuthSession.selectSiteAffinityExecution({
-    toolMeta: meta,
-    tabs: affinityTabs.map(function (tab) {
-      return { tabId: tab.id, url: tab.url };
-    }),
-    initiatorTabId: safeInitiatorTabId(trustedInitiatorTabId)
-  });
+  var selectedTabIdArg = toolArguments && toolArguments.__authTabId;
+  if (typeof selectedTabIdArg === 'string' && /^\d+$/.test(selectedTabIdArg)) {
+    selectedTabIdArg = Number(selectedTabIdArg);
+  }
+  function selectAffinity() {
+    return AiRuntimeAuthSession.selectSiteAffinityExecution({
+      toolMeta: meta,
+      tabs: affinityTabs.map(function (tab) {
+        return { tabId: tab.id, url: tab.url };
+      }),
+      initiatorTabId: safeInitiatorTabId(trustedInitiatorTabId),
+      selectedTabId: safeInitiatorTabId(selectedTabIdArg)
+    });
+  }
+  var affinity = await selectAffinity();
+  if (
+    !affinity.ok &&
+    affinity.errorCode === 'AUTH_SESSION_MISSING' &&
+    affinity.probeHint &&
+    AiRuntimeAuth.classifyOperation(meta) === 'read'
+  ) {
+    // One shot at revalidating a recently-expired credential via probe.
+    var probeOutcome = await attemptAuthProbeRevalidation(
+      affinity.probeHint,
+      meta,
+      toolArguments
+    );
+    if (probeOutcome === 'rejected') {
+      return buildMcpAuthError('AUTH_REJECTED', affinity);
+    }
+    if (probeOutcome === 'refreshed') {
+      affinity = await selectAffinity();
+    }
+  }
   if (!affinity.ok) {
+    if (Array.isArray(affinity.candidates)) {
+      affinity.candidates.forEach(function (candidate) {
+        var tab = affinityTabs.find(function (item) {
+          return item && item.id === candidate.tabId;
+        });
+        if (tab && tab.title) candidate.title = tab.title;
+      });
+    }
     return buildMcpAuthError(
       affinity.errorCode || 'AUTH_TAB_REQUIRED',
       affinity

@@ -304,13 +304,51 @@ function mergeArchivedRequestRecords(records) {
   var added = 0;
   for (i = 0; i < records.length; i++) {
     var rec = records[i];
-    if (!rec || !rec.id || byId[rec.id]) continue;
+    if (!rec || !rec.id) continue;
+    var existing = byId[rec.id];
+    if (existing) {
+      if (preferArchivedResponseBody(rec.responseBody, existing.responseBody)) {
+        existing.responseBody = rec.responseBody;
+        existing.responseStatus = rec.responseStatus != null ? rec.responseStatus : existing.responseStatus;
+        existing.responseHeaders = rec.responseHeaders != null ? rec.responseHeaders : existing.responseHeaders;
+        if (typeof invalidateProvenanceCache === 'function') invalidateProvenanceCache(existing);
+        else {
+          delete existing._provBodyStr;
+          delete existing._provIndex;
+        }
+      }
+      continue;
+    }
     state.requestRecords.push(rec);
     byId[rec.id] = rec;
     added++;
   }
   while (state.requestRecords.length > MAX_RECORDS) state.requestRecords.shift();
   return added;
+}
+
+function isTruncatedArchiveBody(body) {
+  return !!(body && typeof body === 'object' && !Array.isArray(body) && body.__archiveTruncated);
+}
+
+function responseBodySearchableScore(body) {
+  if (body === null || typeof body === 'undefined') return 0;
+  if (isTruncatedArchiveBody(body)) {
+    return typeof body.preview === 'string' ? Math.min(body.preview.length, 1000) : 1;
+  }
+  if (typeof body === 'string') return body.length > 0 ? body.length : 0;
+  if (typeof body === 'object') {
+    try {
+      return JSON.stringify(body).length;
+    } catch (e) {
+      return 2;
+    }
+  }
+  return 1;
+}
+
+function preferArchivedResponseBody(incoming, existing) {
+  return responseBodySearchableScore(incoming) > responseBodySearchableScore(existing);
 }
 
 function loadArchivedFlowRecords(recordStorageKey) {

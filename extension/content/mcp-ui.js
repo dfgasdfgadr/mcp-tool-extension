@@ -529,7 +529,16 @@ function buildMcpFlowTreeHTML() {
   var gi;
   for (gi = 0; gi < groups.length; gi++) {
     if (groups[gi].tools.length > 0) hasVisible = true;
-    else if (groups[gi].kind !== 'system' && groups[gi].kind !== 'other' && groups[gi].flow) hasVisible = true;
+    else if (
+      groups[gi].kind === 'manual' &&
+      groups[gi].flow
+    ) hasVisible = true;
+    else if (
+      groups[gi].kind !== 'system' &&
+      groups[gi].kind !== 'other' &&
+      groups[gi].missingRefs &&
+      groups[gi].missingRefs.length > 0
+    ) hasVisible = true;
   }
   if (!hasVisible) {
     return '<div class="ai-req-mcp-empty">无匹配项，调整筛选或关键词</div>';
@@ -547,6 +556,12 @@ function buildMcpFlowTreeHTML() {
     var collapsed = !!ui.collapsedFlowIds[group.key];
     if (group.tools.length === 0 && !isNamedFlow) continue;
     if (isNamedFlow && group.tools.length === 0 && !group.flow) continue;
+    if (
+      isNamedFlow &&
+      group.tools.length === 0 &&
+      group.kind !== 'manual' &&
+      !(group.missingRefs && group.missingRefs.length)
+    ) continue;
     var chevron = collapsed ? '\u25B6' : '\u25BC';
     var kindBadge = '';
     if (isNamedFlow) {

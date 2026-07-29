@@ -198,15 +198,52 @@ function rebuildActiveFlowRecordingSignaturesFromRecords() {
 }
 
 function isDuplicateRequestRecord(record) {
+  return !!findDuplicateRequestRecord(record);
+}
+
+function findDuplicateRequestRecord(record) {
+  if (!record) return null;
   if (state.flowRecording) {
-    return isDuplicateInActiveFlowRecording(record);
+    var sigs = state.activeFlowRecordingSignatures;
+    if (!sigs || typeof sigs !== 'object') return null;
+    var flowSig = computeFlowRecordingSignature(record);
+    var existingId = sigs[flowSig];
+    if (!existingId) return null;
+    var records = state.requestRecords || [];
+    for (var i = 0; i < records.length; i++) {
+      if (records[i] && records[i].id === existingId) return records[i];
+    }
+    return null;
   }
   var sig = computeRequestSignature(record);
-  var records = state.requestRecords || [];
-  for (var i = 0; i < records.length; i++) {
-    if (computeRequestSignature(records[i]) === sig) return true;
+  var all = state.requestRecords || [];
+  for (var j = 0; j < all.length; j++) {
+    if (computeRequestSignature(all[j]) === sig) return all[j];
   }
-  return false;
+  return null;
+}
+
+function updateExistingRequestRecord(existing, incoming) {
+  if (!existing || !incoming) return existing;
+  existing.timestamp = incoming.timestamp;
+  existing.url = incoming.url || existing.url;
+  existing.originalUrl = incoming.originalUrl || existing.originalUrl;
+  existing.requestHeaders = incoming.requestHeaders != null ? incoming.requestHeaders : existing.requestHeaders;
+  existing.requestBody = incoming.requestBody !== undefined ? incoming.requestBody : existing.requestBody;
+  existing.responseStatus = incoming.responseStatus;
+  existing.responseHeaders = incoming.responseHeaders != null ? incoming.responseHeaders : existing.responseHeaders;
+  existing.responseBody = incoming.responseBody;
+  existing.duration = incoming.duration;
+  if (incoming.isMocked !== undefined) existing.isMocked = incoming.isMocked;
+  if (incoming.mockData !== undefined) existing.mockData = incoming.mockData;
+  if (incoming.debugRule !== undefined) existing.debugRule = incoming.debugRule;
+  if (typeof invalidateProvenanceCache === 'function') {
+    invalidateProvenanceCache(existing);
+  } else {
+    delete existing._provBodyStr;
+    delete existing._provIndex;
+  }
+  return existing;
 }
 
 function isInsideAiReqUi(el) {
@@ -302,7 +339,7 @@ function classifyFlowRequest(record) {
   var method = (record.method || 'GET').toUpperCase();
   var lower = String(url || '').toLowerCase();
   if (/\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|mp4|mp3|wav|avi|map|webp)(\?|#|$)/i.test(url)) return 'noise';
-  if (/track|analytics|sentry|beacon|collect|log|monitor/.test(lower)) return 'noise';
+  if (/(?:^|[\/_.?=&-])(?:track|analytics|sentry|beacon|collect|logs?|monitor)(?:[\/_.?=&-]|$)/.test(lower)) return 'noise';
   if (/i18n|locale|translation|translations/.test(lower)) return 'noise';
   if (/config|dict|setting/.test(lower)) return 'support';
   if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') return 'core';
@@ -448,7 +485,13 @@ function addRequestRecord(record) {
   if (record.debugRule) {
     record.debugRule = normalizeRule(record.debugRule, getMockKey(record.originalUrl || record.url), record.method);
   }
-  if (isDuplicateRequestRecord(record)) return;
+  var existing = findDuplicateRequestRecord(record);
+  if (existing) {
+    updateExistingRequestRecord(existing, record);
+    if (state.flowRecording) syncFlowRecordToBackground(existing);
+    if (state.isPanelOpen) refreshRequestList();
+    return;
+  }
   state.requestRecords.push(record);
   attachRequestToActiveFlow(record);
   syncFlowRecordToBackground(record);

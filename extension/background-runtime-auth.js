@@ -18,6 +18,9 @@
   var invalidationHook = null;
   var LIVE_AUTH_MAX_AGE_MS = 5 * 60 * 1000;
   var SAME_PATH_MAX_AGE_MS = 5 * 60 * 1000;
+  // Recently-expired records are retained (not usable for dispatch) so an
+  // MCP call can revalidate them with a lightweight probe request.
+  var STALE_AUTH_MAX_AGE_MS = 30 * 60 * 1000;
 
   function normalizeHttpUrl(value) {
     try {
@@ -716,6 +719,18 @@
     }).join('');
   }
 
+  // Short non-reversible tag used only to let users tell accounts apart.
+  // Never expose the fingerprint itself (it contains raw credential bytes).
+  function fingerprintAccountTag(fingerprint) {
+    var hash = 0x811c9dc5;
+    var str = String(fingerprint || '');
+    for (var i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    return ('0000000' + hash.toString(16)).slice(-8);
+  }
+
   function observeLiveAuth(observation) {
     var source = observation && typeof observation === 'object'
       ? observation
@@ -820,12 +835,14 @@
       return liveAuthError('AUTH_CONTEXT_STALE');
     }
     var checkedAt = typeof now === 'number' && isFinite(now) ? now : Date.now();
-    if (
-      checkedAt < record.observedAt ||
-      checkedAt - record.observedAt > LIVE_AUTH_MAX_AGE_MS
-    ) {
-      delete records[tabId];
-      if (!Object.keys(records).length) delete liveAuthByOrigin[normalized];
+    var ageMs = checkedAt - record.observedAt;
+    if (checkedAt < record.observedAt || ageMs > LIVE_AUTH_MAX_AGE_MS) {
+      // Only physically drop the record once it passes the stale-retention
+      // window; before that it can still be revalidated via probe.
+      if (checkedAt < record.observedAt || ageMs > STALE_AUTH_MAX_AGE_MS) {
+        delete records[tabId];
+        if (!Object.keys(records).length) delete liveAuthByOrigin[normalized];
+      }
       return liveAuthError('AUTH_CONTEXT_STALE');
     }
     var explicitHeaders = Object.create(null);
@@ -840,6 +857,42 @@
         explicitHeaders: explicitHeaders,
         authHeaderNames: record.authHeaderNames.slice(),
         detectedAuthType: record.detectedAuthType,
+        observedAt: record.observedAt,
+        sessionEpoch: record.sessionEpoch
+      }
+    };
+  }
+
+  // Returns a recently-expired record for probe revalidation only. The record
+  // must sit inside the stale-retention window and match the current trusted
+  // epoch (cookie/logout changes bump the epoch and make it unusable).
+  function getStaleAuthForProbe(origin, tabId, now) {
+    var normalized = normalizeOrigin(origin);
+    var records = normalized && liveAuthByOrigin[normalized];
+    var record = records && records[tabId];
+    if (!record) return liveAuthError('AUTH_SESSION_MISSING');
+    if (
+      !isEpochTrusted(normalized) ||
+      record.sessionEpoch !== getEpoch(normalized)
+    ) {
+      return liveAuthError('AUTH_CONTEXT_STALE');
+    }
+    var checkedAt = typeof now === 'number' && isFinite(now) ? now : Date.now();
+    var ageMs = checkedAt - record.observedAt;
+    if (checkedAt < record.observedAt || ageMs > STALE_AUTH_MAX_AGE_MS) {
+      return liveAuthError('AUTH_CONTEXT_STALE');
+    }
+    var explicitHeaders = Object.create(null);
+    Object.keys(record.explicitHeaders).forEach(function (name) {
+      explicitHeaders[name] = record.explicitHeaders[name];
+    });
+    return {
+      ok: true,
+      staleAuth: {
+        origin: record.origin,
+        tabId: record.tabId,
+        explicitHeaders: explicitHeaders,
+        authHeaderNames: record.authHeaderNames.slice(),
         observedAt: record.observedAt,
         sessionEpoch: record.sessionEpoch
       }
@@ -910,6 +963,7 @@
     var meta = source.toolMeta || {};
     var tabs = Array.isArray(source.tabs) ? source.tabs : [];
     var initiatorTabId = source.initiatorTabId;
+    var selectedTabId = source.selectedTabId;
     var pathPatternKey = meta.pathPatternKey ||
       AiSiteAffinity.buildPathPatternKey(meta.method, meta.pathname || meta.pathnameTemplate);
     var recordedHosts = AiSiteAffinity.collectRecordedHostnames(meta);
@@ -957,23 +1011,84 @@
       if (tokenRequired) {
         var live = getLiveAuth(probe.origin, tab.tabId, Date.now());
         if (!live.ok) {
+          var stale = getStaleAuthForProbe(probe.origin, tab.tabId, Date.now());
           return {
             ok: false,
             reason: 'missing_live_auth',
-            errorCode: 'AUTH_SESSION_MISSING'
+            errorCode: 'AUTH_SESSION_MISSING',
+            probe: stale.ok
+              ? { tabId: tab.tabId, origin: probe.origin }
+              : null
           };
         }
       }
       return {
         ok: true,
         tabId: tab.tabId,
+        url: tab.url,
         finalOrigin: probe.origin,
         matchLevel: level
       };
     }
 
+    function buildEffectiveResult(entry, extra) {
+      var result = {
+        ok: true,
+        finalOrigin: entry.finalOrigin,
+        tabId: entry.tabId,
+        matchLevel: entry.matchLevel,
+        pathPatternKey: pathPatternKey
+      };
+      if (extra) Object.assign(result, extra);
+      return result;
+    }
+
+    // Sanitized candidate list for user-side account selection. Carries only a
+    // non-reversible accountTag — never raw credentials or fingerprints.
+    function buildAmbiguousCandidates(effectiveList) {
+      var candidates = [];
+      for (var i = 0; i < effectiveList.length; i++) {
+        var entry = effectiveList[i];
+        var live = getLiveAuth(entry.finalOrigin, entry.tabId, Date.now());
+        candidates.push({
+          tabId: entry.tabId,
+          url: entry.url || '',
+          observedAt: live.ok ? live.authBundle.observedAt : null,
+          accountTag: live.ok
+            ? fingerprintAccountTag(
+                canonicalCredentialSnapshot(live.authBundle.explicitHeaders)
+              )
+            : 'unknown',
+          _fingerprint: live.ok
+            ? canonicalCredentialSnapshot(live.authBundle.explicitHeaders)
+            : ''
+        });
+      }
+      return candidates;
+    }
+
+    function sanitizeCandidates(candidates) {
+      return candidates.map(function (c) {
+        return {
+          tabId: c.tabId,
+          url: c.url,
+          observedAt: c.observedAt,
+          accountTag: c.accountTag
+        };
+      });
+    }
+
+    function ambiguousWithCandidates(effectiveList) {
+      var error = liveAuthError('AUTH_ACCOUNT_AMBIGUOUS');
+      error.candidates = sanitizeCandidates(
+        buildAmbiguousCandidates(effectiveList)
+      );
+      return error;
+    }
+
     function collect(level) {
       var effective = [];
+      var probeCandidates = [];
       var multiOrigin = false;
       var sourceUnsafe = false;
       var hostHitMissingAuth = false;
@@ -986,10 +1101,14 @@
         if (ev.ok) effective.push(ev);
         else if (ev.errorCode === 'AUTH_SOURCE_UNSAFE') sourceUnsafe = true;
         else if (ev.reason === 'multi_api_origin') multiOrigin = true;
-        else if (ev.reason === 'missing_live_auth') hostHitMissingAuth = true;
+        else if (ev.reason === 'missing_live_auth') {
+          hostHitMissingAuth = true;
+          if (ev.probe) probeCandidates.push(ev.probe);
+        }
       });
       return {
         effective: effective,
+        probeCandidates: probeCandidates,
         multiOrigin: multiOrigin,
         sourceUnsafe: sourceUnsafe,
         hostHitMissingAuth: hostHitMissingAuth,
@@ -1004,6 +1123,9 @@
       l2 = collect('L2');
       chosen = l2;
     }
+    var probeCandidates = l1.probeCandidates.length
+      ? l1.probeCandidates
+      : (l2 ? l2.probeCandidates : []);
     var multiOrigin = l1.multiOrigin || !!(l2 && l2.multiOrigin);
     var sourceUnsafe = l1.sourceUnsafe || !!(l2 && l2.sourceUnsafe);
     var hostHitMissingAuth = l1.hostHitMissingAuth ||
@@ -1026,16 +1148,61 @@
       return liveAuthError('AUTH_TAB_REQUIRED');
     }
 
-    if (chosen.effective.length === 1) {
-      return {
-        ok: true,
-        finalOrigin: chosen.effective[0].finalOrigin,
-        tabId: chosen.effective[0].tabId,
-        matchLevel: chosen.effective[0].matchLevel,
-        pathPatternKey: pathPatternKey
-      };
+    // Explicit user selection from a previous AUTH_ACCOUNT_AMBIGUOUS response.
+    // Only honored against tabs that already passed evaluate() — it cannot be
+    // used to pin an arbitrary tab.
+    if (
+      Number.isSafeInteger(selectedTabId) &&
+      selectedTabId >= 0 &&
+      chosen.effective.length >= 1
+    ) {
+      var picked = chosen.effective.filter(function (e) {
+        return e.tabId === selectedTabId;
+      });
+      if (picked.length === 1) return buildEffectiveResult(picked[0]);
+      // Stale or invalid selection: surface the current candidates again.
+      return ambiguousWithCandidates(chosen.effective);
     }
-    if (chosen.effective.length > 1) return liveAuthError('AUTH_ACCOUNT_AMBIGUOUS');
+
+    if (chosen.effective.length === 1) {
+      return buildEffectiveResult(chosen.effective[0]);
+    }
+    if (chosen.effective.length > 1) {
+      var originGroups = Object.create(null);
+      var originKeys = [];
+      chosen.effective.forEach(function (e) {
+        if (!originGroups[e.finalOrigin]) {
+          originGroups[e.finalOrigin] = true;
+          originKeys.push(e.finalOrigin);
+        }
+      });
+      // Distinct API origins (e.g. different ports) cannot be merged safely.
+      if (originKeys.length > 1) return liveAuthError('AUTH_ACCOUNT_AMBIGUOUS');
+      var candidates = buildAmbiguousCandidates(chosen.effective);
+      var firstFingerprint = candidates[0]._fingerprint;
+      var allSameAccount = !!firstFingerprint && candidates.every(function (c) {
+        return c._fingerprint === firstFingerprint;
+      });
+      if (allSameAccount) {
+        // Same credentials in every effective tab — one account, pick the
+        // most recently observed tab instead of failing.
+        var newestIndex = 0;
+        for (var ci = 0; ci < candidates.length; ci++) {
+          if (
+            (candidates[ci].observedAt || 0) >=
+            (candidates[newestIndex].observedAt || 0)
+          ) {
+            newestIndex = ci;
+          }
+        }
+        return buildEffectiveResult(chosen.effective[newestIndex], {
+          authMerged: 'same_account'
+        });
+      }
+      var ambiguous = liveAuthError('AUTH_ACCOUNT_AMBIGUOUS');
+      ambiguous.candidates = sanitizeCandidates(candidates);
+      return ambiguous;
+    }
     // Prefer AUTH_SOURCE_UNSAFE over multi-origin ambiguity / tab-required when
     // recorded origins cannot be safely resolved (e.g. same host, two ports).
     if (sourceUnsafe) return liveAuthError('AUTH_SOURCE_UNSAFE');
@@ -1044,7 +1211,16 @@
       // Bearer/custom tools require a live token observation from the matched
       // tab. Cookie-only fallback looks "successful" then gets 403 on sites
       // that actually need Authorization (e.g. dh-platform). Fail closed.
-      return liveAuthError('AUTH_SESSION_MISSING');
+      var missingAuthError = liveAuthError('AUTH_SESSION_MISSING');
+      if (probeCandidates.length === 1) {
+        // Single tab with a recently-expired record: caller may revalidate
+        // it with a lightweight probe instead of failing outright.
+        missingAuthError.probeHint = {
+          tabId: probeCandidates[0].tabId,
+          origin: probeCandidates[0].origin
+        };
+      }
+      return missingAuthError;
     }
     return liveAuthError('AUTH_TAB_REQUIRED');
   }
@@ -1382,6 +1558,7 @@
     observeLiveAuth: observeLiveAuth,
     observeSamePathApi: observeSamePathApi,
     getLiveAuth: getLiveAuth,
+    getStaleAuthForProbe: getStaleAuthForProbe,
     listSamePathApiOrigins: listSamePathApiOrigins,
     selectSiteAffinityExecution: selectSiteAffinityExecution,
     listLiveTabContexts: listLiveTabContexts,

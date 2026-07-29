@@ -501,23 +501,30 @@ function buildFlowTreeGroups(toolsMap, flowsMap, options) {
     var fid = flowIdsFromMap[fi];
     var flow = flowsMap[fid];
     if (!flow) continue;
-    var title = flow.name || flow.id;
-    var subtitle = '';
-    if (flow.hostname === '*') subtitle = '\u8de8\u7ad9';
-    else if (nameCounts[title] > 1) subtitle = flow.hostname || '';
+    var flowTools = byFlowId[fid] || [];
     var missingRefs = [];
     var mcpNames = flow.mcpToolNames || [];
     var mi;
     for (mi = 0; mi < mcpNames.length; mi++) {
       if (!toolsMap[mcpNames[mi]]) missingRefs.push(mcpNames[mi]);
     }
+    var kind = inferFlowKind(flow);
+    // 录制流程在尚未生成/关联 MCP 工具前不出现在 MCP 页，避免结束录制后出现空流程记录
+    if (kind !== 'manual' && flowTools.length === 0 && missingRefs.length === 0) {
+      delete byFlowId[fid];
+      continue;
+    }
+    var title = flow.name || flow.id;
+    var subtitle = '';
+    if (flow.hostname === '*') subtitle = '\u8de8\u7ad9';
+    else if (nameCounts[title] > 1) subtitle = flow.hostname || '';
     namedGroups.push({
       key: fid,
       title: title,
       subtitle: subtitle,
       flowId: fid,
-      kind: inferFlowKind(flow),
-      tools: sortToolsByFlowOrder(flow, byFlowId[fid] || []),
+      kind: kind,
+      tools: sortToolsByFlowOrder(flow, flowTools),
       missingRefs: missingRefs,
       flow: flow
     });
