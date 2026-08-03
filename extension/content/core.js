@@ -489,6 +489,9 @@ function addRequestRecord(record) {
   if (existing) {
     updateExistingRequestRecord(existing, record);
     if (state.flowRecording) syncFlowRecordToBackground(existing);
+    // Always re-push credentials: first capture may lack Authorization;
+    // later same-signature requests must refresh liveAuth TTL/fingerprint.
+    notifySiteIdentityFromRecord(record);
     if (state.isPanelOpen) refreshRequestList();
     return;
   }

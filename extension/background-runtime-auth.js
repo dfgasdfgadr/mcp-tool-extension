@@ -25,8 +25,11 @@
   // service-worker restart does not silently wipe observed credentials.
   // storage.session is scoped to the browser session and never hits disk.
   var LIVE_AUTH_STORAGE_KEY = 'ai_req_live_auth_snapshot_v1';
+  var SAME_PATH_STORAGE_KEY = 'ai_req_same_path_api_snapshot_v1';
   var liveAuthRestoreResult = null;
   var liveAuthPersistQueue = Promise.resolve();
+  var samePathRestoreResult = null;
+  var samePathPersistQueue = Promise.resolve();
 
   function normalizeHttpUrl(value) {
     try {
@@ -516,6 +519,7 @@
           purgeSamePathApiForOrigin(normalized);
         }
         scheduleLiveAuthPersist();
+        scheduleSamePathPersist();
         if (typeof invalidationHook === 'function') {
           try {
             invalidationHook(normalized, reason || '');
@@ -881,6 +885,111 @@
     return liveAuthRestoreResult;
   }
 
+  function serializeSamePathSnapshot() {
+    var snapshot = Object.create(null);
+    var now = Date.now();
+    Object.keys(samePathApiByTab).forEach(function (tabIdKey) {
+      var list = samePathApiByTab[tabIdKey];
+      if (!Array.isArray(list) || !list.length) return;
+      var kept = list.filter(function (row) {
+        return row &&
+          row.apiOrigin &&
+          row.pathPatternKey &&
+          typeof row.observedAt === 'number' &&
+          isFinite(row.observedAt) &&
+          row.observedAt >= 0 &&
+          now - row.observedAt <= SAME_PATH_MAX_AGE_MS;
+      }).map(function (row) {
+        return {
+          apiOrigin: row.apiOrigin,
+          pathPatternKey: row.pathPatternKey,
+          observedAt: row.observedAt
+        };
+      });
+      if (kept.length) snapshot[tabIdKey] = kept;
+    });
+    return snapshot;
+  }
+
+  function scheduleSamePathPersist() {
+    samePathPersistQueue = samePathPersistQueue
+      .catch(function () {})
+      .then(function () {
+        return new Promise(function (resolve) {
+          var area = getLiveAuthStorageArea();
+          if (!area) {
+            resolve(false);
+            return;
+          }
+          var payload = {};
+          payload[SAME_PATH_STORAGE_KEY] = serializeSamePathSnapshot();
+          try {
+            area.set(payload, function () {
+              resolve(!(chrome.runtime && chrome.runtime.lastError));
+            });
+          } catch (_err) {
+            resolve(false);
+          }
+        });
+      });
+    return samePathPersistQueue;
+  }
+
+  function ensureSamePathRestored() {
+    if (samePathRestoreResult) return samePathRestoreResult;
+    samePathRestoreResult = new Promise(function (resolve) {
+      var area = getLiveAuthStorageArea();
+      if (!area) {
+        resolve(false);
+        return;
+      }
+      try {
+        area.get(SAME_PATH_STORAGE_KEY, function (items) {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            resolve(false);
+            return;
+          }
+          var snapshot = items && items[SAME_PATH_STORAGE_KEY];
+          var now = Date.now();
+          if (snapshot && typeof snapshot === 'object') {
+            Object.keys(snapshot).forEach(function (tabIdKey) {
+              var tabId = Number(tabIdKey);
+              if (!Number.isSafeInteger(tabId) || tabId < 0) return;
+              var rows = snapshot[tabIdKey];
+              if (!Array.isArray(rows)) return;
+              // In-memory rows are newer — never overwrite a tab that already
+              // has observations from this SW lifetime.
+              if (samePathApiByTab[tabId] && samePathApiByTab[tabId].length) {
+                return;
+              }
+              var restored = [];
+              rows.forEach(function (row) {
+                if (!row || typeof row !== 'object') return;
+                var apiOrigin = normalizeOrigin(row.apiOrigin);
+                var pathPatternKey = String(row.pathPatternKey || '');
+                var observedAt = normalizeObservedAt(row.observedAt);
+                if (!apiOrigin || !pathPatternKey || observedAt === null) return;
+                if (now < observedAt || now - observedAt > SAME_PATH_MAX_AGE_MS) {
+                  return;
+                }
+                restored.push({
+                  apiOrigin: apiOrigin,
+                  pathPatternKey: pathPatternKey,
+                  observedAt: observedAt
+                });
+              });
+              if (restored.length) samePathApiByTab[tabId] = restored;
+            });
+          }
+          resolve(true);
+        });
+      } catch (_err) {
+        resolve(false);
+      }
+    });
+    return samePathRestoreResult;
+  }
+
   function observeLiveAuth(observation) {
     var source = observation && typeof observation === 'object'
       ? observation
@@ -914,8 +1023,9 @@
         existing.sessionEpoch === getEpoch(origin) &&
         observedAt < existing.observedAt
       ) {
+        // Older packet than what we already stored — ignore quietly.
         return {
-          skipObservation: true,
+          ignoreStaleObservation: true,
           epoch: existing.sessionEpoch
         };
       }
@@ -942,11 +1052,12 @@
       }
       return { skipSave: false, epoch: getEpoch(origin) };
     }).then(function (decision) {
-      if (decision.skipObservation) {
+      if (decision.ignoreStaleObservation) {
         return {
-          ok: false,
-          skipped: true,
-          errorCode: 'AUTH_CONTEXT_STALE'
+          ok: true,
+          ignored: true,
+          reason: 'stale_observation',
+          sessionEpoch: decision.epoch
         };
       }
       if (decision.skipSave) {
@@ -1071,17 +1182,20 @@
     }
     // Never trust a future client clock — clamp so TTL cannot exceed 5 minutes from now.
     observedAt = Math.min(observedAt, Date.now());
-    if (!samePathApiByTab[tabId]) samePathApiByTab[tabId] = [];
-    var list = samePathApiByTab[tabId].filter(function (row) {
-      return !(row.apiOrigin === apiOrigin && row.pathPatternKey === pathPatternKey);
+    return ensureSamePathRestored().then(function () {
+      if (!samePathApiByTab[tabId]) samePathApiByTab[tabId] = [];
+      var list = samePathApiByTab[tabId].filter(function (row) {
+        return !(row.apiOrigin === apiOrigin && row.pathPatternKey === pathPatternKey);
+      });
+      list.push({
+        apiOrigin: apiOrigin,
+        pathPatternKey: pathPatternKey,
+        observedAt: observedAt
+      });
+      samePathApiByTab[tabId] = list;
+      scheduleSamePathPersist();
+      return { ok: true };
     });
-    list.push({
-      apiOrigin: apiOrigin,
-      pathPatternKey: pathPatternKey,
-      observedAt: observedAt
-    });
-    samePathApiByTab[tabId] = list;
-    return Promise.resolve({ ok: true });
   }
 
   function listSamePathApiOrigins(tabId, pathPatternKey, now) {
@@ -1111,10 +1225,12 @@
         delete samePathApiByTab[tabId];
       }
     });
+    scheduleSamePathPersist();
   }
 
   async function selectSiteAffinityExecution(input) {
     await ensureLiveAuthRestored();
+    await ensureSamePathRestored();
     var source = input || {};
     var meta = source.toolMeta || {};
     var tabs = Array.isArray(source.tabs) ? source.tabs : [];
@@ -1168,10 +1284,17 @@
         var live = getLiveAuth(probe.origin, tab.tabId, Date.now());
         if (!live.ok) {
           var stale = getStaleAuthForProbe(probe.origin, tab.tabId, Date.now());
+          // TTL-expired but still probeable → AUTH_SESSION_MISSING + probeHint.
+          // Epoch mismatch / unrecoverable stale → AUTH_CONTEXT_STALE.
+          var errorCode = live.errorCode === 'AUTH_CONTEXT_STALE' && !stale.ok
+            ? 'AUTH_CONTEXT_STALE'
+            : 'AUTH_SESSION_MISSING';
           return {
             ok: false,
-            reason: 'missing_live_auth',
-            errorCode: 'AUTH_SESSION_MISSING',
+            reason: errorCode === 'AUTH_CONTEXT_STALE'
+              ? 'stale_live_auth'
+              : 'missing_live_auth',
+            errorCode: errorCode,
             probe: stale.ok
               ? { tabId: tab.tabId, origin: probe.origin }
               : null
@@ -1248,6 +1371,7 @@
       var multiOrigin = false;
       var sourceUnsafe = false;
       var hostHitMissingAuth = false;
+      var hostHitStaleAuth = false;
       var hostHit = false;
       tabs.forEach(function (tab) {
         if (!tab || typeof tab.tabId !== 'number') return;
@@ -1257,7 +1381,9 @@
         if (ev.ok) effective.push(ev);
         else if (ev.errorCode === 'AUTH_SOURCE_UNSAFE') sourceUnsafe = true;
         else if (ev.reason === 'multi_api_origin') multiOrigin = true;
-        else if (ev.reason === 'missing_live_auth') {
+        else if (ev.reason === 'stale_live_auth') {
+          hostHitStaleAuth = true;
+        } else if (ev.reason === 'missing_live_auth') {
           hostHitMissingAuth = true;
           if (ev.probe) probeCandidates.push(ev.probe);
         }
@@ -1268,6 +1394,7 @@
         multiOrigin: multiOrigin,
         sourceUnsafe: sourceUnsafe,
         hostHitMissingAuth: hostHitMissingAuth,
+        hostHitStaleAuth: hostHitStaleAuth,
         hostHit: hostHit
       };
     }
@@ -1286,6 +1413,8 @@
     var sourceUnsafe = l1.sourceUnsafe || !!(l2 && l2.sourceUnsafe);
     var hostHitMissingAuth = l1.hostHitMissingAuth ||
       !!(l2 && l2.hostHitMissingAuth);
+    var hostHitStaleAuth = l1.hostHitStaleAuth ||
+      !!(l2 && l2.hostHitStaleAuth);
 
     if (Number.isSafeInteger(initiatorTabId) && initiatorTabId >= 0) {
       var hit = chosen.effective.filter(function (e) {
@@ -1363,6 +1492,11 @@
     // recorded origins cannot be safely resolved (e.g. same host, two ports).
     if (sourceUnsafe) return liveAuthError('AUTH_SOURCE_UNSAFE');
     if (multiOrigin) return liveAuthError('AUTH_ACCOUNT_AMBIGUOUS');
+    // Prefer AUTH_CONTEXT_STALE (epoch churn) over generic SESSION_MISSING so
+    // callers do not treat a cookie/logout bump as "never observed a token".
+    if (hostHitStaleAuth && !hostHitMissingAuth) {
+      return liveAuthError('AUTH_CONTEXT_STALE');
+    }
     if (hostHitMissingAuth) {
       // Bearer/custom tools require a live token observation from the matched
       // tab. Cookie-only fallback looks "successful" then gets 403 on sites
@@ -1378,6 +1512,7 @@
       }
       return missingAuthError;
     }
+    if (hostHitStaleAuth) return liveAuthError('AUTH_CONTEXT_STALE');
     return liveAuthError('AUTH_TAB_REQUIRED');
   }
 
@@ -1408,7 +1543,10 @@
       return Promise.resolve({ ok: true, affectedOrigins: [] });
     }
     return ensureLiveAuthRestored().then(function () {
+      return ensureSamePathRestored();
+    }).then(function () {
       delete samePathApiByTab[tabId];
+      scheduleSamePathPersist();
       var origins = Object.keys(liveAuthByOrigin);
       Object.keys(liveObservationQueues).forEach(function (origin) {
         if (origins.indexOf(origin) < 0) origins.push(origin);
@@ -1719,7 +1857,9 @@
     getLiveAuth: getLiveAuth,
     getStaleAuthForProbe: getStaleAuthForProbe,
     ensureLiveAuthRestored: ensureLiveAuthRestored,
+    ensureSamePathRestored: ensureSamePathRestored,
     scheduleLiveAuthPersist: scheduleLiveAuthPersist,
+    scheduleSamePathPersist: scheduleSamePathPersist,
     listSamePathApiOrigins: listSamePathApiOrigins,
     selectSiteAffinityExecution: selectSiteAffinityExecution,
     listLiveTabContexts: listLiveTabContexts,

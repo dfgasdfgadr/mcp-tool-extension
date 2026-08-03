@@ -2894,11 +2894,12 @@ async function prepareMcpRuntimeExecution(
   var affinity = await selectAffinity();
   if (
     !affinity.ok &&
-    affinity.errorCode === 'AUTH_SESSION_MISSING' &&
     affinity.probeHint &&
     AiRuntimeAuth.classifyOperation(meta) === 'read'
   ) {
     // One shot at revalidating a recently-expired credential via probe.
+    // Triggered by probeHint presence (not a specific errorCode) so TTL-stale
+    // SESSION_MISSING and future codes with a probe tip both work.
     var probeOutcome = await attemptAuthProbeRevalidation(
       affinity.probeHint,
       meta,
