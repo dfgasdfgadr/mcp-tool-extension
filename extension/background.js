@@ -1449,7 +1449,12 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
         observedAt: Date.now()
       });
     }).then(function (result) {
-      if (result && (result.ok || result.skipped)) return null;
+      if (result && result.ok) return null;
+      if (result && result.skipped) {
+        // Observation carried no reusable credential headers — surface this
+        // to the panel instead of swallowing it as success.
+        return result.errorCode || 'AUTH_OBSERVATION_SKIPPED';
+      }
       return result && result.errorCode
         ? safeRuntimeAuthErrorCode(result, 'AUTH_OBSERVATION_FAILED')
         : 'AUTH_OBSERVATION_FAILED';
@@ -2538,8 +2543,31 @@ function fallbackFetch(url, method, headers, body, credentialsMode) {
   });
 }
 
-function buildMcpAuthError(errorCode, details) {
-  var source = details && typeof details === 'object' ? details : {};
+// Attach the real session epoch to error details so logs and MCP error
+// payloads stop reporting the meaningless default 0.
+async function withSessionEpoch(details, origin) {
+  var result = details && typeof details === 'object' ? details : {};
+  var normalized = '';
+  try {
+    var parsed = new URL(origin);
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      parsed.hostname
+    ) {
+      normalized = parsed.origin;
+    }
+  } catch (_parseError) {}
+  if (!normalized) return result;
+  try {
+    await AiRuntimeAuthSession.ensureEpochLoaded(normalized);
+    if (AiRuntimeAuthSession.isEpochTrusted(normalized)) {
+      result.sessionEpoch = AiRuntimeAuthSession.getEpoch(normalized);
+    }
+  } catch (_epochError) {}
+  return result;
+}
+
+function buildMcpAuthError(errorCode, details) {  var source = details && typeof details === 'object' ? details : {};
   var code = safeRuntimeAuthErrorCode(
     { errorCode: errorCode },
     'AUTH_SOURCE_UNSAFE'
@@ -2547,7 +2575,7 @@ function buildMcpAuthError(errorCode, details) {
   var messages = {
     AUTH_TAB_REQUIRED: '请打开并登录目标站点后重试。',
     AUTH_COOKIE_MISSING: '当前浏览器没有目标站点 Cookie。',
-    AUTH_SESSION_MISSING: '未获取到当前页面的实时登录凭据。',
+    AUTH_SESSION_MISSING: '未获取到当前页面的实时登录凭据。若目标站点当前使用 Cookie 会话，可在入参加 __authMode: \'cookie\' 后重试。',
     AUTH_REJECTED: '服务端拒绝了当前浏览器会话。',
     AUTH_CONTEXT_STALE: '检测到账号会话已变化，请重新发起操作。',
     AUTH_ACCOUNT_AMBIGUOUS: '存在多个账号上下文，请从候选列表中选择目标页面后以 __authTabId 重试。',
@@ -2616,6 +2644,7 @@ function finishMcpToolCall(
     duration: Date.now() - startTime,
     proxyMode: safeResult.proxyMode || 'none',
     authSource: authDetails.authSource || 'none',
+    authModeOverride: authDetails.authModeOverride || '',
     sessionEpoch: Number(authDetails.sessionEpoch || 0),
     dispatchState: safeResult.dispatchState ||
       (safeResult.requestDispatched === false ? 'pre_dispatch' : 'completed'),
@@ -2779,6 +2808,7 @@ async function attemptAuthProbeRevalidation(probeHint, meta, toolArguments) {
   var origin = probeHint && probeHint.origin;
   var tabId = probeHint && probeHint.tabId;
   if (!origin || typeof tabId !== 'number') return 'failed';
+  await AiRuntimeAuthSession.ensureLiveAuthRestored();
   var stale = AiRuntimeAuthSession.getStaleAuthForProbe(origin, tabId, Date.now());
   if (!stale.ok) return 'failed';
   var parted = partitionMcpToolArguments(meta, toolArguments || {});
@@ -2835,13 +2865,22 @@ async function prepareMcpRuntimeExecution(
     affinityTabs = await findTabsForSiteAffinity(meta);
   } catch (error) {
     return buildMcpAuthError(
-      safeRuntimeAuthErrorCode(error, 'AUTH_TAB_QUERY_FAILED')
+      safeRuntimeAuthErrorCode(error, 'AUTH_TAB_QUERY_FAILED'),
+      await withSessionEpoch(
+        null,
+        resolveIdentityOriginForToolMeta(meta, matchedStorageHost)
+      )
     );
   }
   var selectedTabIdArg = toolArguments && toolArguments.__authTabId;
   if (typeof selectedTabIdArg === 'string' && /^\d+$/.test(selectedTabIdArg)) {
     selectedTabIdArg = Number(selectedTabIdArg);
   }
+  // Explicit caller opt-in: allow a bearer/custom-recorded tool to fall back
+  // to the browser cookie session. Without this parameter the pipeline stays
+  // fail-closed on AUTH_SESSION_MISSING.
+  var authModeOverrideArg =
+    toolArguments && toolArguments.__authMode === 'cookie' ? 'cookie' : '';
   function selectAffinity() {
     return AiRuntimeAuthSession.selectSiteAffinityExecution({
       toolMeta: meta,
@@ -2866,11 +2905,28 @@ async function prepareMcpRuntimeExecution(
       toolArguments
     );
     if (probeOutcome === 'rejected') {
-      return buildMcpAuthError('AUTH_REJECTED', affinity);
+      return buildMcpAuthError(
+        'AUTH_REJECTED',
+        await withSessionEpoch(affinity, affinity.probeHint.origin)
+      );
     }
     if (probeOutcome === 'refreshed') {
       affinity = await selectAffinity();
     }
+  }
+  if (
+    !affinity.ok &&
+    affinity.errorCode === 'AUTH_SESSION_MISSING' &&
+    authModeOverrideArg === 'cookie'
+  ) {
+    // Caller explicitly asked for the cookie session: re-run selection with
+    // the token requirement dropped so the browser_cookie path can proceed.
+    meta = Object.assign({}, meta, {
+      detectedAuthType: 'cookie',
+      authHeaderNames: ['cookie']
+    });
+    affinity = await selectAffinity();
+    if (affinity.ok) affinity.authModeOverride = 'cookie';
   }
   if (!affinity.ok) {
     if (Array.isArray(affinity.candidates)) {
@@ -2883,7 +2939,10 @@ async function prepareMcpRuntimeExecution(
     }
     return buildMcpAuthError(
       affinity.errorCode || 'AUTH_TAB_REQUIRED',
-      affinity
+      await withSessionEpoch(
+        affinity,
+        resolveIdentityOriginForToolMeta(meta, matchedStorageHost)
+      )
     );
   }
   var origin = '';
@@ -2917,7 +2976,10 @@ async function prepareMcpRuntimeExecution(
   try {
     await AiRuntimeAuthSession.ensureRegistryLoaded();
   } catch (_registryError) {
-    return buildMcpAuthError('AUTH_CONTEXT_STALE', affinity);
+    return buildMcpAuthError(
+      'AUTH_CONTEXT_STALE',
+      await withSessionEpoch(affinity, origin)
+    );
   }
 
   var operationClass = AiRuntimeAuth.classifyOperation(meta);
@@ -2936,8 +2998,11 @@ async function prepareMcpRuntimeExecution(
   if (!resolution.ok) {
     return buildMcpAuthError(
       resolution.errorCode || 'AUTH_SOURCE_UNSAFE',
-      resolution
+      await withSessionEpoch(resolution, origin)
     );
+  }
+  if (authModeOverrideArg) {
+    resolution.authModeOverride = authModeOverrideArg;
   }
   var merged = AiRuntimeAuth.mergeAndValidateHeaders(
     mergeMcpUntrustedHeaderSources(meta),
@@ -2947,7 +3012,7 @@ async function prepareMcpRuntimeExecution(
   if (!merged.ok) {
     return buildMcpAuthError(
       merged.errorCode || 'AUTH_SOURCE_UNSAFE',
-      resolution
+      await withSessionEpoch(resolution, origin)
     );
   }
   var built = buildMcpProxyPayload(

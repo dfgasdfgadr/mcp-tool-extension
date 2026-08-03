@@ -631,7 +631,28 @@ function notifySiteIdentityFromRecord(record) {
         apiHostname: apiUrl.hostname,
         pageOrigin: location.origin,
         requestHeaders: headers
-      }).catch(function () {});
+      }, function (res) {
+        if (chrome.runtime.lastError) return;
+        var code = res && res.observationErrorCode;
+        var prev = state.lastAuthObservation;
+        var changed = false;
+        if (code) {
+          if (!prev || prev.errorCode !== code || prev.apiOrigin !== apiUrl.origin) {
+            state.lastAuthObservation = {
+              apiOrigin: apiUrl.origin,
+              errorCode: code,
+              at: Date.now()
+            };
+            changed = true;
+          }
+        } else if (prev && prev.apiOrigin === apiUrl.origin) {
+          state.lastAuthObservation = null;
+          changed = true;
+        }
+        if (changed && state.isPanelOpen && typeof refreshRequestList === 'function') {
+          refreshRequestList();
+        }
+      });
     }
     var method = (record.method || 'GET').toUpperCase();
     chrome.runtime.sendMessage({

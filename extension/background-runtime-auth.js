@@ -21,6 +21,12 @@
   // Recently-expired records are retained (not usable for dispatch) so an
   // MCP call can revalidate them with a lightweight probe request.
   var STALE_AUTH_MAX_AGE_MS = 30 * 60 * 1000;
+  // Live auth records are mirrored into chrome.storage.session so an MV3
+  // service-worker restart does not silently wipe observed credentials.
+  // storage.session is scoped to the browser session and never hits disk.
+  var LIVE_AUTH_STORAGE_KEY = 'ai_req_live_auth_snapshot_v1';
+  var liveAuthRestoreResult = null;
+  var liveAuthPersistQueue = Promise.resolve();
 
   function normalizeHttpUrl(value) {
     try {
@@ -490,6 +496,7 @@
       if (!Number.isSafeInteger(candidate) || candidate < 0) {
         markEpochUntrusted(normalized);
         delete liveAuthByOrigin[normalized];
+        scheduleLiveAuthPersist();
         throw storageError(
           'SESSION_EPOCH_OVERFLOW',
           'session epoch cannot be incremented safely'
@@ -508,6 +515,7 @@
           delete liveAuthByOrigin[normalized];
           purgeSamePathApiForOrigin(normalized);
         }
+        scheduleLiveAuthPersist();
         if (typeof invalidationHook === 'function') {
           try {
             invalidationHook(normalized, reason || '');
@@ -517,6 +525,7 @@
       }, function (error) {
         markEpochUntrusted(normalized);
         delete liveAuthByOrigin[normalized];
+        scheduleLiveAuthPersist();
         throw error;
       });
     });
@@ -731,6 +740,147 @@
     return ('0000000' + hash.toString(16)).slice(-8);
   }
 
+  function getLiveAuthStorageArea() {
+    try {
+      return (
+        typeof chrome !== 'undefined' &&
+        chrome.storage &&
+        chrome.storage.session
+      ) ? chrome.storage.session : null;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function serializeLiveAuthSnapshot() {
+    var snapshot = Object.create(null);
+    Object.keys(liveAuthByOrigin).forEach(function (origin) {
+      var records = liveAuthByOrigin[origin];
+      if (!records) return;
+      var out = Object.create(null);
+      Object.keys(records).forEach(function (tabId) {
+        var record = records[tabId];
+        if (!record) return;
+        var explicitHeaders = Object.create(null);
+        Object.keys(record.explicitHeaders || {}).forEach(function (name) {
+          explicitHeaders[name] = record.explicitHeaders[name];
+        });
+        out[tabId] = {
+          origin: record.origin,
+          tabId: record.tabId,
+          explicitHeaders: explicitHeaders,
+          authHeaderNames: (record.authHeaderNames || []).slice(),
+          detectedAuthType: record.detectedAuthType,
+          observedAt: record.observedAt,
+          sessionEpoch: record.sessionEpoch,
+          fingerprint: record.fingerprint
+        };
+      });
+      if (Object.keys(out).length) snapshot[origin] = out;
+    });
+    return snapshot;
+  }
+
+  // Write-through mirror of liveAuthByOrigin. Serialized behind a queue so
+  // bursts of observations collapse into sequential storage writes.
+  function scheduleLiveAuthPersist() {
+    liveAuthPersistQueue = liveAuthPersistQueue
+      .catch(function () {})
+      .then(function () {
+        return new Promise(function (resolve) {
+          var area = getLiveAuthStorageArea();
+          if (!area) {
+            resolve(false);
+            return;
+          }
+          var payload = {};
+          payload[LIVE_AUTH_STORAGE_KEY] = serializeLiveAuthSnapshot();
+          try {
+            area.set(payload, function () {
+              resolve(!(chrome.runtime && chrome.runtime.lastError));
+            });
+          } catch (_err) {
+            resolve(false);
+          }
+        });
+      });
+    return liveAuthPersistQueue;
+  }
+
+  // One-time restore of the persisted snapshot after a service-worker
+  // restart. Records outside the stale-retention window are dropped; the
+  // epoch checks in getLiveAuth/getStaleAuthForProbe reject anything whose
+  // sessionEpoch no longer matches the trusted epoch.
+  function ensureLiveAuthRestored() {
+    if (liveAuthRestoreResult) return liveAuthRestoreResult;
+    liveAuthRestoreResult = new Promise(function (resolve) {
+      var area = getLiveAuthStorageArea();
+      if (!area) {
+        resolve(false);
+        return;
+      }
+      try {
+        area.get(LIVE_AUTH_STORAGE_KEY, function (items) {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            resolve(false);
+            return;
+          }
+          var snapshot = items && items[LIVE_AUTH_STORAGE_KEY];
+          var now = Date.now();
+          if (snapshot && typeof snapshot === 'object') {
+            Object.keys(snapshot).forEach(function (origin) {
+              var normalized = normalizeOrigin(origin);
+              if (!normalized || normalized !== origin) return;
+              var records = snapshot[origin];
+              if (!records || typeof records !== 'object') return;
+              Object.keys(records).forEach(function (tabIdKey) {
+                var record = records[tabIdKey];
+                if (!record || typeof record !== 'object') return;
+                var tabId = Number(tabIdKey);
+                var observedAt = normalizeObservedAt(record.observedAt);
+                if (!Number.isSafeInteger(tabId) || tabId < 0) return;
+                if (observedAt === null) return;
+                if (now < observedAt || now - observedAt > STALE_AUTH_MAX_AGE_MS) {
+                  return;
+                }
+                if (
+                  !record.explicitHeaders ||
+                  typeof record.explicitHeaders !== 'object'
+                ) {
+                  return;
+                }
+                if (!liveAuthByOrigin[normalized]) {
+                  liveAuthByOrigin[normalized] = Object.create(null);
+                }
+                // In-memory records are newer — never overwrite them.
+                if (liveAuthByOrigin[normalized][tabId]) return;
+                liveAuthByOrigin[normalized][tabId] = {
+                  origin: normalized,
+                  tabId: tabId,
+                  explicitHeaders: record.explicitHeaders,
+                  authHeaderNames: Array.isArray(record.authHeaderNames)
+                    ? record.authHeaderNames
+                    : [],
+                  detectedAuthType:
+                    typeof record.detectedAuthType === 'string'
+                      ? record.detectedAuthType
+                      : 'none',
+                  observedAt: observedAt,
+                  sessionEpoch: Number(record.sessionEpoch || 0),
+                  fingerprint: String(record.fingerprint || '')
+                };
+              });
+            });
+          }
+          resolve(true);
+        });
+      } catch (_err) {
+        resolve(false);
+      }
+    });
+    return liveAuthRestoreResult;
+  }
+
   function observeLiveAuth(observation) {
     var source = observation && typeof observation === 'object'
       ? observation
@@ -753,6 +903,8 @@
     var fingerprint = canonicalCredentialSnapshot(extracted.explicitHeaders);
     var previous = liveObservationQueues[origin] || Promise.resolve();
     var operation = previous.catch(function () {}).then(function () {
+      return ensureLiveAuthRestored();
+    }).then(function () {
       return ensureEpochLoaded(origin);
     }).then(function () {
       var records = liveAuthByOrigin[origin];
@@ -798,6 +950,7 @@
         };
       }
       if (decision.skipSave) {
+        scheduleLiveAuthPersist();
         return {
           ok: true,
           refreshed: true,
@@ -817,6 +970,7 @@
         sessionEpoch: decision.epoch,
         fingerprint: fingerprint
       };
+      scheduleLiveAuthPersist();
       return { ok: true, sessionEpoch: decision.epoch };
     });
     liveObservationQueues[origin] = operation;
@@ -842,6 +996,7 @@
       if (checkedAt < record.observedAt || ageMs > STALE_AUTH_MAX_AGE_MS) {
         delete records[tabId];
         if (!Object.keys(records).length) delete liveAuthByOrigin[normalized];
+        scheduleLiveAuthPersist();
       }
       return liveAuthError('AUTH_CONTEXT_STALE');
     }
@@ -959,6 +1114,7 @@
   }
 
   async function selectSiteAffinityExecution(input) {
+    await ensureLiveAuthRestored();
     var source = input || {};
     var meta = source.toolMeta || {};
     var tabs = Array.isArray(source.tabs) ? source.tabs : [];
@@ -1251,29 +1407,31 @@
     ) {
       return Promise.resolve({ ok: true, affectedOrigins: [] });
     }
-    delete samePathApiByTab[tabId];
-    var origins = Object.keys(liveAuthByOrigin);
-    Object.keys(liveObservationQueues).forEach(function (origin) {
-      if (origins.indexOf(origin) < 0) origins.push(origin);
-    });
-    var invalidations = origins.map(function (origin) {
-      var previous = liveObservationQueues[origin] || Promise.resolve();
-      var operation = previous.catch(function () {}).then(function () {
-        var records = liveAuthByOrigin[origin];
-        if (!records || !records[tabId]) return null;
-        delete records[tabId];
-        return bumpEpoch(origin, reason || 'tab_invalidated').then(function () {
-          return origin;
+    return ensureLiveAuthRestored().then(function () {
+      delete samePathApiByTab[tabId];
+      var origins = Object.keys(liveAuthByOrigin);
+      Object.keys(liveObservationQueues).forEach(function (origin) {
+        if (origins.indexOf(origin) < 0) origins.push(origin);
+      });
+      var invalidations = origins.map(function (origin) {
+        var previous = liveObservationQueues[origin] || Promise.resolve();
+        var operation = previous.catch(function () {}).then(function () {
+          var records = liveAuthByOrigin[origin];
+          if (!records || !records[tabId]) return null;
+          delete records[tabId];
+          return bumpEpoch(origin, reason || 'tab_invalidated').then(function () {
+            return origin;
+          });
         });
+        liveObservationQueues[origin] = operation;
+        return operation;
       });
-      liveObservationQueues[origin] = operation;
-      return operation;
-    });
-    return Promise.all(invalidations).then(function (results) {
-      var affectedOrigins = results.filter(function (origin) {
-        return !!origin;
+      return Promise.all(invalidations).then(function (results) {
+        var affectedOrigins = results.filter(function (origin) {
+          return !!origin;
+        });
+        return { ok: true, affectedOrigins: affectedOrigins };
       });
-      return { ok: true, affectedOrigins: affectedOrigins };
     });
   }
 
@@ -1350,6 +1508,7 @@
   }
 
   async function resolveRuntimeAuth(input) {
+    await ensureLiveAuthRestored();
     var source = input && typeof input === 'object' ? input : {};
     var origin = normalizeOrigin(source.origin);
     if (!origin) return liveAuthError('AUTH_SOURCE_UNSAFE');
@@ -1559,6 +1718,8 @@
     observeSamePathApi: observeSamePathApi,
     getLiveAuth: getLiveAuth,
     getStaleAuthForProbe: getStaleAuthForProbe,
+    ensureLiveAuthRestored: ensureLiveAuthRestored,
+    scheduleLiveAuthPersist: scheduleLiveAuthPersist,
     listSamePathApiOrigins: listSamePathApiOrigins,
     selectSiteAffinityExecution: selectSiteAffinityExecution,
     listLiveTabContexts: listLiveTabContexts,

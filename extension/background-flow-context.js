@@ -678,12 +678,24 @@ function mergeSiteIdentityRecord(existing, apiOrigin, pageOrigin, requestHeaders
   var siteRoot = (typeof AiSiteAffinity !== 'undefined' && apiHostname)
     ? (AiSiteAffinity.deriveSiteRoot(apiHostname) || prev.siteRoot || '')
     : (prev.siteRoot || '');
+  // Prefer the live epoch store over the stale persisted copy so panels and
+  // tool meta stop showing a sessionEpoch frozen at 0.
+  var sessionEpoch = Number(prev.sessionEpoch || 0);
+  try {
+    if (
+      typeof AiRuntimeAuthSession !== 'undefined' &&
+      typeof AiRuntimeAuthSession.isEpochTrusted === 'function' &&
+      AiRuntimeAuthSession.isEpochTrusted(normalizedOrigin)
+    ) {
+      sessionEpoch = AiRuntimeAuthSession.getEpoch(normalizedOrigin);
+    }
+  } catch (_epochError) {}
   return {
     apiOrigin: normalizedOrigin,
     apiHostname: apiHostname,
     detectedAuthType: detectedAuthType,
     authHeaderNames: authHeaderNames,
-    sessionEpoch: Number(prev.sessionEpoch || 0),
+    sessionEpoch: sessionEpoch,
     updatedAt: Date.now(),
     pageOrigins: pageOrigins,
     recordedApiOrigins: recordedApiOrigins,

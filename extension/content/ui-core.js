@@ -2246,6 +2246,21 @@ function appendRequestRowToList(listElInner, req, kwEffective) {
   listElInner.appendChild(itemInner);
 }
 
+function renderAuthObservationHint(listEl) {
+  var obs = state.lastAuthObservation;
+  if (!obs || !obs.errorCode) return;
+  var banner = document.createElement('div');
+  banner.className = 'ai-req-auth-obs-hint';
+  banner.style.cssText = 'padding:6px 10px;margin:0 0 6px;font-size:12px;' +
+    'line-height:1.5;color:#d29922;background:rgba(210,153,34,.12);' +
+    'border:1px solid rgba(210,153,34,.4);border-radius:6px;';
+  banner.textContent = obs.errorCode === 'AUTH_OBSERVATION_SKIPPED'
+    ? '最近请求未识别到可复用的登录凭据头（如 Authorization/token），' +
+      'MCP 调用可能因缺少实时凭据而失败。'
+    : '最近一次登录凭据观察未入库：' + obs.errorCode;
+  listEl.appendChild(banner);
+}
+
 function refreshRequestList(keyword, skipPruneSel) {
   if (!state.mainPanel) return;
   ensureMainUiState();
@@ -2261,6 +2276,7 @@ function refreshRequestList(keyword, skipPruneSel) {
   if (!listEl || !countEl) return;
   var savedScrollTop = listEl.scrollTop;
   listEl.innerHTML = '';
+  renderAuthObservationHint(listEl);
 
   var filtered = filterRequestRecords(state.requestRecords, kwEffective);
   if (!skipPruneSel) {
